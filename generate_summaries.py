@@ -1,14 +1,6 @@
 #!/usr/bin/env python3
 """
 Скрипт для генерации конспектов из транскрипций видео обучающего курса.
-Использует Claude CLI для создания подробных конспектов.
-
-Структура входных файлов:
-  output/Модуль N/video-N-M-название-видео.md
-  output/Модуль N/module-N.md
-
-Структура выходных файлов:
-  claude-summary/Модуль N/summary-N-M-название-видео.md
 """
 
 import os
@@ -16,7 +8,6 @@ import re
 import sys
 import subprocess
 import glob
-import tempfile
 from pathlib import Path
 
 
@@ -25,15 +16,10 @@ from pathlib import Path
 # ─────────────────────────────────────────────
 
 OUTPUT_DIR = "output"
-
 CLAUDE_CMD = r"C:\Users\Proger4\AppData\Roaming\npm\claude.cmd"
-
 SUMMARY_OUTPUT_DIR = "claude-summary"
-
 SKIP_EXISTING = True
-
 VERBOSE = True
-
 TIMEOUT = 600
 
 
@@ -100,20 +86,16 @@ def find_video_files(output_dir: str) -> list:
         path = Path(filepath)
         folder = path.parent
         filename = path.stem
-
         match = re.match(r'video-(\d+)-(\d+)-(.*)', filename)
         if not match:
             continue
-
         module_num = match.group(1)
         video_num = match.group(2)
         video_name = match.group(3)
-
         module_file = folder / f"module-{module_num}.md"
         summary_name = f"summary-{module_num}-{video_num}-{video_name}.md"
         relative_subfolder = path.parent.relative_to(output_dir)
         summary_path = Path(SUMMARY_OUTPUT_DIR) / relative_subfolder / summary_name
-
         video_files.append({
             "transcription_path": filepath,
             "module_file": str(module_file) if module_file.exists() else None,
@@ -122,7 +104,6 @@ def find_video_files(output_dir: str) -> list:
             "video_num": video_num,
             "video_name": video_name,
         })
-
     return video_files
 
 
@@ -175,7 +156,6 @@ def build_prompt(video_info: dict, transcription: str, module_context: str) -> s
                 parts.append(f"URL: {url}\nСодержимое:\n{content}\n")
         if parts:
             links_section = "СОДЕРЖИМОЕ ССЫЛОК ИЗ УРОКА:\n" + "\n---\n".join(parts)
-
     return SUMMARY_PROMPT_TEMPLATE.format(
         module_context=module_context or "Нет описания модуля",
         transcription=transcription,
@@ -185,37 +165,37 @@ def build_prompt(video_info: dict, transcription: str, module_context: str) -> s
 
 def run_claude(prompt: str) -> str:
     """
-    Запускает claude напрямую через subprocess.Popen,
-    передаёт промпт через stdin (encode utf-8),
-    читает stdout побайтово и декодирует с заменой битых символов.
-    Никакого PowerShell — нет ограничений на длину командной строки.
+    Согласно --help:
+      claude [options] [prompt]   -- промпт как аргумент
+      -p / --print                -- не-интерактивный режим, выводит ответ и выходит
+      --input-format text         -- читать промпт из stdin (работает с --print)
+
+    Промпт слишком длинный для аргумента командной строки, поэтому:
+    - передаём ПУСТУЮ строку как prompt-аргумент (или не передаём)
+    - используем --input-format text чтобы claude читал из stdin
+    - пишем промпт в stdin через Popen.communicate()
     """
-    # Кодируем промпт в байты UTF-8
     prompt_bytes = prompt.encode('utf-8')
 
-    # Запускаем: claude --print -p -
-    # Флаг -p - означает "читай промпт из stdin"
     proc = subprocess.Popen(
-        [CLAUDE_CMD, "--print", "-p", "-"],
+        [CLAUDE_CMD, "--print", "--input-format", "text", "--dangerously-skip-permissions"],
         stdin=subprocess.PIPE,
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
-        # НЕ указываем encoding/text — работаем с байтами напрямую
     )
 
     try:
-        stdout_bytes, stderr_bytes = proc.communicate(
-            input=prompt_bytes,
-            timeout=TIMEOUT,
-        )
+        stdout_bytes, stderr_bytes = proc.communicate(input=prompt_bytes, timeout=TIMEOUT)
     except subprocess.TimeoutExpired:
         proc.kill()
         proc.communicate()
         raise RuntimeError(f"Превышено время ожидания {TIMEOUT} сек.")
 
-    # Декодируем с заменой нечитаемых байт
     stdout = stdout_bytes.decode('utf-8', errors='replace').strip()
     stderr = stderr_bytes.decode('utf-8', errors='replace').strip()
+
+    if stderr:
+        log(f"         stderr: {stderr[:300]}")
 
     if proc.returncode != 0 or not stdout:
         raise RuntimeError(
@@ -267,7 +247,7 @@ def process_video(video_info: dict, idx: int, total: int) -> bool:
     prompt = build_prompt(video_info, transcription, module_context)
     log(f"         Размер промпта: {len(prompt)} символов")
 
-    log("         Запускаю Claude CLI (stdin режим)...")
+    log("         Запускаю Claude CLI...")
     try:
         summary = run_claude(prompt)
     except RuntimeError as e:
