@@ -42,8 +42,9 @@ CLAUDE_CMD    = r"C:\Users\Proger4\AppData\Roaming\npm\claude.cmd"
 SUMMARY_DIR   = "claude-summary"
 SKIP_EXISTING = True
 CACHE_FILENAME  = ".extract_cache.json"  # кеш этапа 1, хранится в папке каждого модуля
+BATCH_SIZE      = 4                       # макс. видео в одном батч-запросе этапа 1
 VERBOSE       = True
-TIMEOUT       = 600
+TIMEOUT       = 1800
 
 
 # ─────────────────────────────────────────────
@@ -281,11 +282,48 @@ def parse_json_response(raw: str) -> dict:
 # ОСНОВНАЯ ЛОГИКА
 # ─────────────────────────────────────────────
 
-def step1_extract(videos: list[VideoInfo], module_dir: Path) -> dict[str, str]:
+def step1_extract_batch(batch: list["VideoInfo"], all_videos: list["VideoInfo"]) -> dict[str, str]:
     """
-    Этап 1: один запрос к Claude — читает все саммари модуля,
-    возвращает JSON с релевантным текстом для каждого видео.
-    Результат кешируется в файл — при повторном запуске берётся из кеша.
+    Вспомогательная функция: запускает один батч-запрос к Claude.
+    batch     — видео, для которых извлекаем текст (3-4 штуки)
+    all_videos — все видео модуля (для контекста в саммари)
+    """
+    sep = "-" * 40
+
+    # Список только тех видео, для которых нужна выборка
+    video_list = "\n".join(
+        f"  Видео {v.video_num}: {v.video_title}"
+        for v in batch
+    )
+
+    # Все саммари модуля как контекст
+    all_summaries = ""
+    for v in all_videos:
+        text = read_file(v.source_path)
+        if text:
+            all_summaries += (
+                f"\n\n{sep}\n"
+                f"# ВИДЕО {v.video_num}: {v.video_title}\n"
+                f"{sep}\n\n"
+                f"{text}"
+            )
+
+    prompt = EXTRACT_PROMPT_TEMPLATE.format(
+        video_list=video_list,
+        all_summaries=all_summaries,
+    )
+
+    log(f"    [батч] Видео {[v.video_num for v in batch]}, промпт: {len(prompt)} символов")
+    raw = run_claude(prompt, SYSTEM_PROMPT_EXTRACTOR)
+    return parse_json_response(raw)
+
+
+def step1_extract(videos: list["VideoInfo"], module_dir: Path) -> dict[str, str]:
+    """
+    Этап 1: извлечение релевантного текста для каждого видео.
+    Если видео <= BATCH_SIZE — один запрос.
+    Если больше — разбивает на батчи по BATCH_SIZE и объединяет JSON.
+    Результат кешируется.
     """
     cache_path = module_dir / CACHE_FILENAME
 
@@ -302,35 +340,25 @@ def step1_extract(videos: list[VideoInfo], module_dir: Path) -> dict[str, str]:
         except Exception as e:
             log(f"  [Этап 1] Кеш повреждён ({e}), запускаю заново...")
 
-    # Список видео для промпта
-    video_list = "\n".join(
-        f"  Видео {v.video_num}: {v.video_title}"
-        for v in videos
-    )
+    extracted: dict[str, str] = {}
 
-    # Все саммари модуля в один текст
-    sep = "-" * 40
-    all_summaries = ""
-    for v in videos:
-        text = read_file(v.source_path)
-        if text:
-            all_summaries += (
-                f"\n\n{sep}\n"
-                f"# ВИДЕО {v.video_num}: {v.video_title}\n"
-                f"{sep}\n\n"
-                f"{text}"
-            )
+    if len(videos) <= BATCH_SIZE:
+        # Небольшой модуль — один запрос
+        log(f"  [Этап 1] Один запрос ({len(videos)} видео)...")
+        extracted = step1_extract_batch(videos, videos)
+    else:
+        # Большой модуль — разбиваем на батчи
+        batches = [videos[i:i + BATCH_SIZE] for i in range(0, len(videos), BATCH_SIZE)]
+        log(f"  [Этап 1] Батч-режим: {len(videos)} видео → {len(batches)} батча по ~{BATCH_SIZE}")
 
-    prompt = EXTRACT_PROMPT_TEMPLATE.format(
-        video_list=video_list,
-        all_summaries=all_summaries,
-    )
-
-    log(f"  [Этап 1] Размер промпта: {len(prompt)} символов")
-    log("  [Этап 1] Запускаю Claude (извлечение релевантного текста)...")
-
-    raw = run_claude(prompt, SYSTEM_PROMPT_EXTRACTOR)
-    extracted = parse_json_response(raw)
+        for i, batch in enumerate(batches, 1):
+            log(f"  [Этап 1] Батч {i}/{len(batches)}...")
+            try:
+                batch_result = step1_extract_batch(batch, videos)
+                extracted.update(batch_result)
+                log(f"  [Этап 1] Батч {i} готов. Блоков в батче: {len(batch_result)}")
+            except RuntimeError as e:
+                log(f"  [Этап 1] [ошибка] Батч {i}: {e}")
 
     # Сохраняем кеш
     try:
@@ -345,7 +373,6 @@ def step1_extract(videos: list[VideoInfo], module_dir: Path) -> dict[str, str]:
         log(f"           Видео {video_num}: {len(text)} символов")
 
     return extracted
-
 
 def step2_write(video: VideoInfo, extracted_text: str) -> str:
     """
